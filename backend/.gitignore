@@ -1,3 +1,13 @@
 # https://dart.dev/guides/libraries/private-files
 # Created by `dart pub`
 .dart_tool/
+
+# Grafi pesanti (Evita di caricare file da centinaia di MB)
+*.graphml
+
+# Python (File temporanei che creano conflitti)
+__pycache__/
+*.py[cod]
+*$py.class
+
+safeguard-c08-firebase-adminsdk-fbsvc-54e53643c3.json
