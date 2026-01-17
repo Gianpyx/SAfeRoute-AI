@@ -13,10 +13,13 @@ class RealtimeMap extends StatefulWidget {
   // Parametri per la modalità selezione
   final bool isSelectionMode;
   final Function(LatLng)? onLocationPicked;
+  final VoidCallback? onCenterPressed;
+
   const RealtimeMap({
     super.key,
     this.isSelectionMode = false, // Default false: comportamento normale
     this.onLocationPicked,
+    this.onCenterPressed,
   });
   @override
   State<RealtimeMap> createState() => _RealtimeMapState();
@@ -431,6 +434,11 @@ class _RealtimeMapState extends State<RealtimeMap> {
                     final newC = LatLng(p.latitude, p.longitude);
                     setState(() => _center = newC);
                     _mapController.move(newC, 15.0);
+
+                    if (widget.onCenterPressed != null) {
+                      widget.onCenterPressed!();
+                    }
+
                   } catch (e) {
                     debugPrint(e.toString());
                   }

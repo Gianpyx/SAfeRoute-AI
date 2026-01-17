@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:http/http.dart' as http;
 import 'package:provider/provider.dart';
 import 'package:frontend/providers/auth_provider.dart';
 import 'package:frontend/ui/widgets/realtime_map.dart';
@@ -17,9 +19,6 @@ class MapScreen extends StatefulWidget {
 class _MapScreenState extends State<MapScreen> {
   // Variabile per il throttling del GPS
   Position? _lastCalculatedPosition;
-
-  // Dati grezzi scaricati dal DB
-  List<Map<String, dynamic>> _allRawPoints = [];
 
   // Lista filtrata e ordinata da mostrare
   List<Map<String, dynamic>> _nearestPoints = [];
@@ -149,7 +148,6 @@ class _MapScreenState extends State<MapScreen> {
               }
             }
 
-            _allRawPoints = loadedPoints;
 
             if (_lastCalculatedPosition != null) {
               // Aggiornamento da DB: force = true (ignora throttling e aggiorna subito)
@@ -170,7 +168,6 @@ class _MapScreenState extends State<MapScreen> {
 
     _databaseSubscription = StreamHelper.combineSafePointsAndHospitals().listen(
       (List<Map<String, dynamic>> combinedPoints) {
-        _allRawPoints = combinedPoints;
         if (_lastCalculatedPosition != null) {
           // Aggiornamento da DB: force = true
           _updateDistances(_lastCalculatedPosition!, force: true);
@@ -182,52 +179,68 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   // Ricalcolo Distanze e Ordinamento
-  void _updateDistances(Position userPos, {bool force = false}) {
-    // Se la lista è vuota (tutto cancellato), puliamo la UI subito
-    if (_allRawPoints.isEmpty) {
-      if (mounted) {
-        setState(() {
-          _nearestPoints = [];
-          _isLoadingList = false;
-        });
-      }
-      return;
-    }
-
-    // OTTIMIZZAZIONE:
-    // Se NON è forzato (viene dal GPS) E lo spostamento è < 10m, non fare nulla.
+  Future<void> _updateDistances(Position userPos, {bool force = false}) async {
+    // Throttling GPS (10 metri)
     if (!force && _lastCalculatedPosition != null) {
       double movement = Geolocator.distanceBetween(
-        userPos.latitude,
-        userPos.longitude,
-        _lastCalculatedPosition!.latitude,
-        _lastCalculatedPosition!.longitude,
+        userPos.latitude, userPos.longitude,
+        _lastCalculatedPosition!.latitude, _lastCalculatedPosition!.longitude,
       );
       if (movement < 10) return;
     }
-
     _lastCalculatedPosition = userPos;
 
-    List<Map<String, dynamic>> tempPoints = List.from(_allRawPoints);
+    // Caricamento solo se necessario
+    if (_nearestPoints.isEmpty) setState(() => _isLoadingList = true);
 
-    for (var point in tempPoints) {
-      point['distance'] = Geolocator.distanceBetween(
-        userPos.latitude,
-        userPos.longitude,
-        point['lat'],
-        point['lng'],
-      );
-    }
+    try {
+      // CHIAMATA AL SERVER PYTHON (IA)
+      // Se usi emulatore Android usa 10.0.2.2, se fisico usa l'IP del PC
+      final response = await http.post(
+        Uri.parse('http://10.0.2.2:8000/api/safe-points/sorted'),
+        headers: {"Content-Type": "application/json"},
+        body: jsonEncode({
+          "lat": userPos.latitude,
+          "lng": userPos.longitude,
+        }),
+      ).timeout(const Duration(seconds: 60));
 
-    tempPoints.sort(
-      (a, b) => (a['distance'] as double).compareTo(b['distance'] as double),
-    );
+      if (response.statusCode == 200) {
+        print("RISPOSTA DA PYTHON: ${response.body}");
+        final List<dynamic> data = json.decode(response.body);
 
-    if (mounted) {
-      setState(() {
-        _nearestPoints = tempPoints.take(8).toList();
-        _isLoadingList = false;
-      });
+        if (mounted) {
+          setState(() {
+            _nearestPoints = data.map((e) => {
+              'title': e['title']?.toString() ?? 'N/A',
+              'subtitle': e['isDangerous'] ? "⚠️ PERCORSO OSTRUITO" : (e['subtitle'] ?? "Sicuro"),
+              'type': e['type']?.toString() ?? '',
+              'lat': (e['lat'] as num).toDouble(),
+              'lng': (e['lng'] as num).toDouble(),
+              'distance': (e['distance'] as num).toDouble(),
+              'isDangerous': e['isDangerous'] ?? false,
+            }).toList();
+
+            _nearestPoints.sort((a, b) {
+              if (a['isDangerous'] != b['isDangerous']) {
+                return a['isDangerous'] ? 1 : -1; // Se a è pericoloso, va dopo (1)
+              }
+              return (a['distance'] as double).compareTo(b['distance'] as double);
+            });
+
+            _isLoadingList = false;
+            _errorList = null;
+          });
+        }
+      }
+    } catch (e) {
+      debugPrint("Errore IA: $e");
+      if (mounted) {
+        setState(() {
+          _errorList = "Server IA offline";
+          _isLoadingList = false;
+        });
+      }
     }
   }
 
@@ -252,7 +265,15 @@ class _MapScreenState extends State<MapScreen> {
       backgroundColor: ColorPalette.backgroundDarkBlue,
       body: Stack(
         children: [
-          const Positioned.fill(child: RealtimeMap()),
+          Positioned.fill(
+            child: RealtimeMap(
+              onCenterPressed: () async {
+                // Otteniamo la posizione attuale e forziamo il ricalcolo
+                Position currentPos = await Geolocator.getCurrentPosition();
+                _updateDistances(currentPos, force: true);
+              },
+            ),
+          ),
 
           DraggableScrollableSheet(
             initialChildSize: 0.4,
@@ -360,94 +381,95 @@ class _MapScreenState extends State<MapScreen> {
                           ),
                         )
                       else
-                        SliverList(
-                          delegate: SliverChildBuilderDelegate((
-                            context,
-                            index,
-                          ) {
-                            final item = _nearestPoints[index];
-                            final double d = item['distance'];
-                            final String distStr = d < 1000
-                                ? "${d.toStringAsFixed(0)} m"
-                                : "${(d / 1000).toStringAsFixed(1)} km";
+                          SliverList(
+                            delegate: SliverChildBuilderDelegate((context, index) {
+                              final item = _nearestPoints[index];
 
-                            IconData itemIcon;
-                            Color iconBgColor;
-                            Color iconColor;
+                              // --- 1. RECUPERA IL FLAG DI PERICOLO DALL'IA ---
+                              final bool isDangerous = item['isDangerous'] ?? false;
 
-                            if (item['type'] == 'hospital') {
-                              itemIcon = Icons.local_hospital;
-                              iconBgColor = Colors.blue.withValues(alpha: 0.2);
-                              iconColor = Colors.blueAccent;
-                            } else if (item['type'] == 'safe_point') {
-                              itemIcon = Icons.verified_user;
-                              iconBgColor = Colors.green.withValues(alpha: 0.2);
-                              iconColor = Colors.greenAccent;
-                            } else {
-                              itemIcon = Icons.report_problem;
-                              iconBgColor = Colors.red.withValues(alpha: 0.2);
-                              iconColor = Colors.redAccent;
-                            }
+                              final double d = item['distance'];
+                              final String distStr = d < 1000
+                                  ? "${d.toStringAsFixed(0)} m"
+                                  : "${(d / 1000).toStringAsFixed(1)} km";
 
-                            return Card(
-                              color: cardColor,
-                              elevation: 4,
-                              margin: const EdgeInsets.symmetric(
-                                horizontal: 15,
-                                vertical: 5,
-                              ),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(15),
-                              ),
-                              child: ListTile(
-                                contentPadding: const EdgeInsets.symmetric(
-                                  horizontal: 15,
-                                  vertical: 5,
+                              IconData itemIcon;
+                              Color iconBgColor;
+                              Color iconColor;
+
+                              // --- 2. LOGICA ICONE: Se è pericoloso, cambia icona a prescindere dal tipo ---
+                              if (isDangerous) {
+                                itemIcon = Icons.warning_amber_rounded;
+                                iconBgColor = Colors.red.withValues(alpha: 0.2);
+                                iconColor = Colors.white;
+                              } else if (item['type'] == 'hospital') {
+                                itemIcon = Icons.local_hospital;
+                                iconBgColor = Colors.blue.withValues(alpha: 0.2);
+                                iconColor = Colors.blueAccent;
+                              } else {
+                                itemIcon = Icons.verified_user;
+                                iconBgColor = Colors.green.withValues(alpha: 0.2);
+                                iconColor = Colors.greenAccent;
+                              }
+
+                              return Card(
+                                // --- 3. CAMBIO COLORE CARD: Se pericoloso diventa rosso scuro ---
+                                color: isDangerous ? const Color(0xFFB71C1C) : cardColor,
+                                elevation: isDangerous ? 0 : 4,
+                                margin: const EdgeInsets.symmetric(horizontal: 15, vertical: 5),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(15),
+                                  // Aggiungiamo un bordo bianco sottile se è pericoloso per farlo risaltare
+                                  side: isDangerous ? const BorderSide(color: Colors.white, width: 1) : BorderSide.none,
                                 ),
-                                leading: CircleAvatar(
-                                  backgroundColor: iconBgColor,
-                                  child: Icon(itemIcon, color: iconColor),
-                                ),
-                                title: Text(
-                                  item['title'],
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.bold,
+                                child: ListTile(
+                                  contentPadding: const EdgeInsets.symmetric(horizontal: 15, vertical: 5),
+                                  leading: CircleAvatar(
+                                    backgroundColor: iconBgColor,
+                                    child: Icon(itemIcon, color: iconColor),
                                   ),
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                                subtitle: Text(
-                                  item['subtitle'],
-                                  style: const TextStyle(
-                                    color: Colors.white70,
-                                    fontSize: 12,
-                                  ),
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                                trailing: Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 10,
-                                    vertical: 5,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: Colors.black26,
-                                    borderRadius: BorderRadius.circular(10),
-                                  ),
-                                  child: Text(
-                                    distStr,
-                                    style: const TextStyle(
+                                  title: Text(
+                                    item['title'],
+                                    style: TextStyle(
                                       color: Colors.white,
                                       fontWeight: FontWeight.bold,
-                                      fontSize: 13,
+                                      // Sbarra il testo se il percorso è bloccato
+                                      decoration: isDangerous ? TextDecoration.lineThrough : null,
+                                    ),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                  subtitle: Text(
+                                    // --- 4. CAMBIO SOTTOTITOLO ---
+                                    isDangerous ? "⚠️ PERCORSO OSTRUITO (IA)" : item['subtitle'],
+                                    style: TextStyle(
+                                      color: isDangerous ? Colors.white : Colors.white70,
+                                      fontSize: 12,
+                                      fontWeight: isDangerous ? FontWeight.bold : FontWeight.normal,
+                                    ),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                  trailing: Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                                    decoration: BoxDecoration(
+                                      color: isDangerous ? Colors.black45 : Colors.black26,
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                    child: Text(
+                                      // Se è pericoloso scriviamo "BLOCCATO" invece della distanza
+                                      isDangerous ? "BLOCCATO" : distStr,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 11,
+                                      ),
                                     ),
                                   ),
                                 ),
-                              ),
-                            );
-                          }, childCount: _nearestPoints.length),
-                        ),
+                              );
+                            }, childCount: _nearestPoints.length),
+                          ),
                       const SliverToBoxAdapter(child: SizedBox(height: 30)),
                     ],
                   ),
