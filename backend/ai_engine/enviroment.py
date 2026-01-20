@@ -3,14 +3,19 @@ import osmnx as ox
 import firebase_admin
 from firebase_admin import credentials, firestore
 
+# Gestisce l'integrazione tra i dati geografici di OpenStreetMap e i dati in tempo reale di Firebase
 class SafeGuardEnv:
+
+    # Inizializza la connessione a Firebase e prepara le variabili per il grafo
     def __init__(self):
         current_dir = os.path.dirname(os.path.abspath(__file__))
         key_path = os.path.join(current_dir, "safeguard-c08-firebase-adminsdk-fbsvc-54e53643c3.json")
 
         try:
+            # Tenta di recuperare un'app Firebase già inizializzata
             firebase_admin.get_app()
         except ValueError:
+            # Se non esiste, la inizializza usando le credenziali fornite
             cred = credentials.Certificate(key_path)
             firebase_admin.initialize_app(cred)
             print("Connessione a Firebase stabilita!")
@@ -22,15 +27,19 @@ class SafeGuardEnv:
     def load_salerno_map(self):
         file_path = "salerno_map.graphml"
         if os.path.exists(file_path):
+            # Carica il grafo precedentemente salvato
             print("Mappa trovata localmente. Caricamento in corso...")
             self.graph = ox.load_graphml(file_path)
             print("Mappa caricata con successo dal file!")
         else:
+            # Scarica la mappa stradale tramite OSMnx filtrando solo le strade percorribili in auto
             print("Scaricamento mappa (Provincia di Salerno) in corso...")
             self.graph = ox.graph_from_place("Provincia di Salerno, Italy", network_type='drive')
             ox.save_graphml(self.graph, file_path)
             print("Mappa scaricata e salvata localmente!")
 
+
+    # Recupera le destinazioni (ospedali e safe points) e le associa ai nodi stradali più vicini
     def get_points_from_firestore(self):
         punti_mappati = []
         collezioni = ['hospitals', 'safe_points']
@@ -38,6 +47,7 @@ class SafeGuardEnv:
         if self.graph is None:
             return []
 
+        # Legge tutti i documenti all'interno della collezione
         for col in collezioni:
             docs = self.db.collection(col).stream()
             for doc in docs:
@@ -52,22 +62,25 @@ class SafeGuardEnv:
                             'name': nome or "Senza nome",
                             'type': col,
                             'node_id': node,
-                            'lat': float(lat),  # Chiavi piatte per compatibilità main.py
+                            'lat': float(lat),
                             'lng': float(lng)
                         })
                     except Exception as err:
                         print(f"Errore mapping per {nome}: {err}")
         return punti_mappati
 
+
+    # Analizza le emergenze attive su Firebase e altera il grafo stradale
+    # rendendo impraticabili le strade nelle zone colpite
     def apply_disaster_manager(self):
         if self.graph is None:
             return []
 
-        # 1. Reset pesi: riportiamo tutto alla lunghezza reale (metri)
+        # Reset pesi: riportiamo tutto alla lunghezza reale (metri)
         for u, v, k, attr in self.graph.edges(data=True, keys=True):
             attr['final_weight'] = attr['length']
 
-        # 2. Unica lettura da Firebase
+        # Filtra solo i disastri con status 'active'
         emergenze_snapshot = list(self.db.collection('active_emergencies').where('status', '==', 'active').stream())
 
         if not emergenze_snapshot:
@@ -86,18 +99,20 @@ class SafeGuardEnv:
 
             hotspots.append({'lat': e_lat, 'lng': e_lng, 'type': tipo})
 
+            # Verifica se il tipo di emergenza è tra quelli che ostruiscono la viabilità
             if tipo in cause_bloccanti and e_lat and e_lng:
                 try:
-                    # 1. Trova il nodo centrale
+                    # Trova il nodo più vicino all'emergenza
                     danger_node = ox.nearest_nodes(self.graph, X=e_lng, Y=e_lat)
 
-                    # Usiamo un set per raccogliere tutti i nodi da bloccare
+                    # Usa un set per raccogliere tutti i nodi da bloccare
                     nodes_to_block = {danger_node}
 
                     # Prendiamo i vicini di 1° grado
                     vicini_1 = list(self.graph.neighbors(danger_node))
                     nodes_to_block.update(vicini_1)
 
+                    # Aggiunge i vicini dei vicini (2° grado) per estendere il raggio di blocco
                     for v in vicini_1:
                         nodes_to_block.update(self.graph.neighbors(v))
 

@@ -7,62 +7,77 @@ import networkx as nx
 import osmnx as ox
 from enviroment import SafeGuardEnv
 
+# Inizializzazione dell'ambiente SafeGuard (Firebase e Grafo Stradale)
 env = SafeGuardEnv()
 
+# Gestisce la mappa caricandola all'avvio del server
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     env.load_salerno_map() # Usa la nuova funzione con cache locale
     yield
 
 app = FastAPI(lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# Configurazione CORS: permette all'app Flutter di comunicare con il server
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+# Coordinate GPS dell'utente
 class UserLocation(BaseModel):
     lat: float
     lng: float
 
+
+# Endpoint principale: riceve la posizione utente, analizza i pericoli tramite IA,
+# calcola i percorsi sul grafo stradale e restituisce i punti sicuri ordinati
 @app.post("/api/safe-points/sorted")
 async def get_sorted_points(req: UserLocation):
     try:
-        # 1. IA: Applica i blocchi stradali
+        # Applica i blocchi stradali
         env.apply_disaster_manager()
 
-        # 2. Prendi i punti da Firebase
+        # Prende i punti sicuri/ospedali dal database
         punti = env.get_points_from_firestore()
 
-        # 3. Trova il nodo dell'utente
+        # Trova il nodo stradale più vicino all'utente
         user_node = ox.nearest_nodes(env.graph, X=req.lng, Y=req.lat)
 
-        # --- OTTIMIZZAZIONE SALVA-TIMEOUT ---
         # Calcoliamo la distanza matematica "volo d'uccello" per trovare i 3 candidati migliori
         for p in punti:
             p['bird_distance'] = ((p['lat'] - req.lat)**2 + (p['lng'] - req.lng)**2)**0.5
 
-        # Filtriamo: prendiamo solo i 3 più vicini geograficamente
-        punti_top = sorted(punti, key=lambda x: x['bird_distance'])[:3]
-        # ------------------------------------
+        # Seleziona i 3 punti geograficamente più vicini
+        punti_top = sorted(punti, key=lambda x: x['bird_distance'])[:5]
 
         results = []
         print("\n--- 🔍 DEBUG IA PERCORSI ---")
 
         for p in punti_top:
+            # Trova il nodo stradale del punto di destinazione
             target_node = ox.nearest_nodes(env.graph, X=p['lng'], Y=p['lat'])
 
-            # Inizializziamo le variabili per evitare l'errore "unresolved reference"
+            # Valori di default per la gestione errori
             dist_w = 0.0
-            dist_r = 0.0
-            diff = 0.0
-            is_dangerous = False
+            #dist_r = 0.0
+            #diff = 0.0
+            #is_dangerous = False
+            is_blocked = False
 
             try:
-                # 1. Distanza Pesata (IA)
+                # Distanza Pesata
                 dist_w = nx.shortest_path_length(env.graph, user_node, target_node, weight='final_weight')
 
-                # 2. Distanza Reale (Metri)
+                # Distanza Reale
                 dist_r = nx.shortest_path_length(env.graph, user_node, target_node, weight='length')
 
                 # 3. Calcolo differenza
                 diff = dist_w - dist_r
+
+                is_blocked = dist_w > 50000
 
                 # Se la differenza è > 5 metri, il percorso è deviato/ostruito
                 is_dangerous = dist_w > (dist_r + 5)
@@ -80,17 +95,22 @@ async def get_sorted_points(req: UserLocation):
                 is_dangerous = True
 
             results.append({
-                "title": p['name'],
-                "type": p['type'],
-                "lat": p['lat'],
-                "lng": p['lng'],
-                "distance": dist_r,
-                "isDangerous": is_dangerous
+                "title": str(p.get('name', 'N/A')),
+                "type": str(p.get('type', 'generic')),
+                "lat": float(p['lat']),
+                "lng": float(p['lng']),
+                # Se is_dangerous è True, inviamo la distanza con la deviazione (dist_w)
+                "distance": float(dist_w) if is_dangerous else float(dist_r),
+                # Inviato per calcolare il "+ ritardo" in Flutter
+                "dist_real": float(dist_r),
+                "isDangerous": bool(is_dangerous),
+                "isBlocked": bool(is_blocked)
             })
 
         print("--- 🏁 FINE DEBUG ---\n")
-        # 6. Ordina: prima i sicuri, poi i pericolosi
-        results.sort(key=lambda x: (x['isDangerous'], x['distance']))
+
+        # Ordina: prima i sicuri, poi i pericolosi
+        results.sort(key=lambda x: x['distance'])
 
         return results
 
@@ -99,4 +119,5 @@ async def get_sorted_points(req: UserLocation):
         return []
 
 if __name__ == "__main__":
+    # Avvio del server
     uvicorn.run(app, host="0.0.0.0", port=8000)

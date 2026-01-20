@@ -110,7 +110,7 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
-  // --- LOGICA REAL-TIME PER SOCCORRITORI ---
+  // Logica real-time per i soccorritori
   void _startListeningToEmergencies() {
     _databaseSubscription?.cancel();
 
@@ -162,7 +162,7 @@ class _MapScreenState extends State<MapScreen> {
         );
   }
 
-  // --- LOGICA REAL-TIME PER CITTADINI ---
+  // Logica real-time per i cittadini
   void _startListeningToSafePoints() {
     _databaseSubscription?.cancel();
 
@@ -194,8 +194,7 @@ class _MapScreenState extends State<MapScreen> {
     if (_nearestPoints.isEmpty) setState(() => _isLoadingList = true);
 
     try {
-      // CHIAMATA AL SERVER PYTHON (IA)
-      // Se usi emulatore Android usa 10.0.2.2, se fisico usa l'IP del PC
+      // Chiamata al server python (IA)
       final response = await http.post(
         Uri.parse('http://10.0.2.2:8000/api/safe-points/sorted'),
         headers: {"Content-Type": "application/json"},
@@ -210,30 +209,43 @@ class _MapScreenState extends State<MapScreen> {
         final List<dynamic> data = json.decode(response.body);
 
         if (mounted) {
+          // Aggiorna lo stato dell'interfaccia utente
           setState(() {
-            _nearestPoints = data.map((e) => {
-              'title': e['title']?.toString() ?? 'N/A',
-              'subtitle': e['isDangerous'] ? "⚠️ PERCORSO OSTRUITO" : (e['subtitle'] ?? "Sicuro"),
-              'type': e['type']?.toString() ?? '',
-              'lat': (e['lat'] as num).toDouble(),
-              'lng': (e['lng'] as num).toDouble(),
-              'distance': (e['distance'] as num).toDouble(),
-              'isDangerous': e['isDangerous'] ?? false,
+            // Converte la lista di dati dinamici ricevuti dal server (JSON) in una lista mappata
+            _nearestPoints = data.map((e) {
+
+              // Recupera i valori con dei default sicuri per evitare i crash
+              final double dEffettiva = (e['distance'] ?? 0.0) as double;
+              final double dReale = (e['dist_real'] ?? dEffettiva) as double;
+              final bool pericoloso = e['isDangerous'] ?? false;
+              final bool bloccato = e['isBlocked'] ?? false;
+
+              // Restituisce una mappa strutturata per ogni punto, pronta per essere usata nei Widget
+              return {
+                'title': e['title']?.toString() ?? 'Punto Ignoto',
+                'lat': (e['lat'] ?? 0.0).toDouble(),
+                'lng': (e['lng'] ?? 0.0).toDouble(),
+                'distance': dEffettiva,
+                'dist_real': dReale,
+                'isDangerous': pericoloso,
+                'isBlocked': bloccato, // <--- AGGIUNTO
+                'type': e['type']?.toString() ?? 'generic',
+
+                // Logica sottotitolo
+                'subtitle': bloccato
+                    ? "⚠️ DESTINAZIONE INACCESSIBILE"
+                    : (pericoloso
+                    ? "⚠️ DEVIAZIONE: +${(dEffettiva - dReale).toStringAsFixed(0)}m"
+                    : "Percorso sicuro"),
+              };
             }).toList();
 
-            _nearestPoints.sort((a, b) {
-              if (a['isDangerous'] != b['isDangerous']) {
-                return a['isDangerous'] ? 1 : -1; // Se a è pericoloso, va dopo (1)
-              }
-              return (a['distance'] as double).compareTo(b['distance'] as double);
-            });
-
             _isLoadingList = false;
-            _errorList = null;
           });
         }
       }
     } catch (e) {
+      // Gestione degli errori di rete o crash del server Python
       debugPrint("Errore IA: $e");
       if (mounted) {
         setState(() {
@@ -383,44 +395,65 @@ class _MapScreenState extends State<MapScreen> {
                       else
                           SliverList(
                             delegate: SliverChildBuilderDelegate((context, index) {
+                              // Recupera l'elemento corrente dalla lista dei punti più vicini
                               final item = _nearestPoints[index];
 
-                              // --- 1. RECUPERA IL FLAG DI PERICOLO DALL'IA ---
+                              // Verifica se il percorso è deviato (dangerous) o totalmente ostruito (blocked)
                               final bool isDangerous = item['isDangerous'] ?? false;
+                              final bool isBlocked = item['isBlocked'] ?? false;
 
+                              // Gestione distanza
                               final double d = item['distance'];
-                              final String distStr = d < 1000
-                                  ? "${d.toStringAsFixed(0)} m"
-                                  : "${(d / 1000).toStringAsFixed(1)} km";
+                              String distStr;
+                              if (isBlocked) {
+                                // Se la destinazione è inaccessibile, non mostra i km
+                                distStr = "BLOCCATO";
+                              } else {
+                                distStr = d < 1000
+                                    ? "${d.toStringAsFixed(0)} m"
+                                    : "${(d / 1000).toStringAsFixed(1)} km";
+                              }
 
                               IconData itemIcon;
                               Color iconBgColor;
                               Color iconColor;
 
-                              // --- 2. LOGICA ICONE: Se è pericoloso, cambia icona a prescindere dal tipo ---
-                              if (isDangerous) {
+                              // Logica Icone
+                              if (isBlocked) {
+                                // Icona per il blocco totale
+                                itemIcon = Icons.block;
+                                iconBgColor = Colors.black.withValues(alpha: 0.4);
+                                iconColor = Colors.redAccent;
+                              } else if (isDangerous) {
+                                // Icona per i percorsi con deviazione
                                 itemIcon = Icons.warning_amber_rounded;
                                 iconBgColor = Colors.red.withValues(alpha: 0.2);
                                 iconColor = Colors.white;
                               } else if (item['type'] == 'hospital') {
+                                // Icona per ospedali
                                 itemIcon = Icons.local_hospital;
                                 iconBgColor = Colors.blue.withValues(alpha: 0.2);
                                 iconColor = Colors.blueAccent;
                               } else {
+                                // Icona per punti sicuri
                                 itemIcon = Icons.verified_user;
                                 iconBgColor = Colors.green.withValues(alpha: 0.2);
                                 iconColor = Colors.greenAccent;
                               }
 
                               return Card(
-                                // --- 3. CAMBIO COLORE CARD: Se pericoloso diventa rosso scuro ---
-                                color: isDangerous ? const Color(0xFFB71C1C) : cardColor,
-                                elevation: isDangerous ? 0 : 4,
+                                // Colore: Nero se bloccato, Rosso se pericoloso, Blu/Arancio standard altrimenti
+                                color: isBlocked
+                                    ? Colors.black
+                                    : (isDangerous ? const Color(0xFFB71C1C) : cardColor),
+                                elevation: (isDangerous || isBlocked) ? 0 : 4,
                                 margin: const EdgeInsets.symmetric(horizontal: 15, vertical: 5),
                                 shape: RoundedRectangleBorder(
                                   borderRadius: BorderRadius.circular(15),
-                                  // Aggiungiamo un bordo bianco sottile se è pericoloso per farlo risaltare
-                                  side: isDangerous ? const BorderSide(color: Colors.white, width: 1) : BorderSide.none,
+                                  // Bordo rosso se bloccato, bianco se solo pericoloso
+                                  side: isBlocked
+                                      ? const BorderSide(color: Colors.redAccent, width: 2)
+                                      : (isDangerous ? const BorderSide(color: Colors.white, width: 1) : BorderSide.none),
                                 ),
                                 child: ListTile(
                                   contentPadding: const EdgeInsets.symmetric(horizontal: 15, vertical: 5),
@@ -433,36 +466,37 @@ class _MapScreenState extends State<MapScreen> {
                                     style: TextStyle(
                                       color: Colors.white,
                                       fontWeight: FontWeight.bold,
-                                      // Sbarra il testo se il percorso è bloccato
-                                      decoration: isDangerous ? TextDecoration.lineThrough : null,
+                                      // Sbarra il testo se è pericoloso o bloccato
+                                      decoration: (isDangerous || isBlocked) ? TextDecoration.lineThrough : null,
                                     ),
                                     maxLines: 1,
                                     overflow: TextOverflow.ellipsis,
                                   ),
                                   subtitle: Text(
-                                    // --- 4. CAMBIO SOTTOTITOLO ---
-                                    isDangerous ? "⚠️ PERCORSO OSTRUITO (IA)" : item['subtitle'],
+                                    // Logica sottotitolo
+                                    isBlocked
+                                        ? "⚠️ DESTINAZIONE INACCESSIBILE"
+                                        : (isDangerous
+                                        ? "⚠️ DEVIAZIONE: +${(item['distance'] - item['dist_real']).toStringAsFixed(0)}m"
+                                        : item['subtitle']),
                                     style: TextStyle(
-                                      color: isDangerous ? Colors.white : Colors.white70,
-                                      fontSize: 12,
-                                      fontWeight: isDangerous ? FontWeight.bold : FontWeight.normal,
+                                      color: isBlocked ? Colors.redAccent : (isDangerous ? Colors.orangeAccent : Colors.white70),
+                                      fontWeight: (isDangerous || isBlocked) ? FontWeight.bold : FontWeight.normal,
                                     ),
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
                                   ),
                                   trailing: Container(
+                                    // Indicatore distanza e stato
                                     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
                                     decoration: BoxDecoration(
-                                      color: isDangerous ? Colors.black45 : Colors.black26,
+                                      color: isBlocked ? Colors.red.withValues(alpha: 0.3) : (isDangerous ? Colors.black45 : Colors.black26),
                                       borderRadius: BorderRadius.circular(10),
                                     ),
                                     child: Text(
-                                      // Se è pericoloso scriviamo "BLOCCATO" invece della distanza
-                                      isDangerous ? "BLOCCATO" : distStr,
-                                      style: const TextStyle(
-                                        color: Colors.white,
+                                      distStr,
+                                      style: TextStyle(
+                                        color: isBlocked ? Colors.redAccent : Colors.white,
                                         fontWeight: FontWeight.bold,
-                                        fontSize: 11,
+                                        fontSize: isBlocked ? 9 : 11,
                                       ),
                                     ),
                                   ),
