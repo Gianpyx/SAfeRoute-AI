@@ -3,22 +3,21 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-import networkx as nx
 import osmnx as ox
+import time # MODIFICA: Necessario per misurare i tempi di esecuzione
 from enviroment import SafeGuardEnv
+from algorithms import standard_dijkstra, bidirectional_dijkstra # MODIFICA: Importiamo le tue pipeline
 
-# Inizializzazione dell'ambiente SafeGuard (Firebase e Grafo Stradale)
+# Inizializzazione dell'ambiente SafeGuard
 env = SafeGuardEnv()
 
-# Gestisce la mappa caricandola all'avvio del server
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    env.load_salerno_map() # Usa la nuova funzione con cache locale
+    env.load_salerno_map()
     yield
 
 app = FastAPI(lifespan=lifespan)
 
-# Configurazione CORS: permette all'app Flutter di comunicare con il server
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,92 +25,97 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# Coordinate GPS dell'utente
 class UserLocation(BaseModel):
     lat: float
     lng: float
 
-
-# Endpoint principale: riceve la posizione utente, analizza i pericoli tramite IA,
-# calcola i percorsi sul grafo stradale e restituisce i punti sicuri ordinati
 @app.post("/api/safe-points/sorted")
 async def get_sorted_points(req: UserLocation):
     try:
-        # Applica i blocchi stradali
         env.apply_disaster_manager()
-
-        # Prende i punti sicuri/ospedali dal database
         punti = env.get_points_from_firestore()
-
-        # Trova il nodo stradale più vicino all'utente
         user_node = ox.nearest_nodes(env.graph, X=req.lng, Y=req.lat)
 
-        # Calcoliamo la distanza matematica "volo d'uccello" per trovare i 3 candidati migliori
         for p in punti:
             p['bird_distance'] = ((p['lat'] - req.lat)**2 + (p['lng'] - req.lng)**2)**0.5
 
-        # Seleziona i 3 punti geograficamente più vicini
         punti_top = sorted(punti, key=lambda x: x['bird_distance'])[:5]
-
         results = []
-        print("\n--- 🔍 DEBUG IA PERCORSI ---")
+
+        # MODIFICA: Prepariamo il grafo non orientato per il bidirezionale (una sola volta)
+        # MODIFICA: Prepariamo il grafo non orientato
+        G_undirected = env.graph.to_undirected()
+
+        # ... (restante codice invariato fino al ciclo for) ...
 
         for p in punti_top:
-            # Trova il nodo stradale del punto di destinazione
             target_node = ox.nearest_nodes(env.graph, X=p['lng'], Y=p['lat'])
 
-            # Valori di default per la gestione errori
-            dist_w = 0.0
-            #dist_r = 0.0
-            #diff = 0.0
-            #is_dangerous = False
-            is_blocked = False
-
             try:
-                # Distanza Pesata
-                dist_w = nx.shortest_path_length(env.graph, user_node, target_node, weight='final_weight')
+                # 1. Funzione PESO UNIFICATA
+                def weight_ia(u, v):
+                    edge_data = G_undirected.get_edge_data(u, v)
+                    if edge_data:
+                        return min(d.get('final_weight', d['length']) for d in edge_data.values())
+                    return 1e9
 
-                # Distanza Reale
-                dist_r = nx.shortest_path_length(env.graph, user_node, target_node, weight='length')
+                # 2. Pipeline Baseline (Distanza Reale)
+                start_t1 = time.perf_counter()
+                dist_r = standard_dijkstra(G_undirected, user_node, target_node, 'length')
+                exec_time_1 = time.perf_counter() - start_t1
 
-                # 3. Calcolo differenza
-                diff = dist_w - dist_r
+                # 3. Pipeline Ricerca (Tua Bidirezionale)
+                start_t2 = time.perf_counter()
+                dist_w = bidirectional_dijkstra(G_undirected, user_node, target_node, weight_ia)
+                exec_time_2 = time.perf_counter() - start_t2
 
+                # --- LOGICA DI CONFRONTO ---
                 is_blocked = dist_w > 50000
-
-                # Se la differenza è > 5 metri, il percorso è deviato/ostruito
-                is_dangerous = dist_w > (dist_r + 5)
+                is_dangerous = dist_w > (dist_r + 10.0)
 
                 status_icon = "⚠️" if is_dangerous else "✅"
-                print(f"📍 {p['name'][:20]} | Reale: {dist_r:.0f}m | IA: {dist_w:.0f}m | Diff: {diff:.0f}m | {status_icon}")
 
-            except nx.NetworkXNoPath:
-                print(f"❌ {p['name'][:20]} | NESSUN PERCORSO (Completamente isolato)")
-                dist_r = 999999
-                is_dangerous = True
+                # MODIFICA: Stampa potenziata con Distanze e Tempi
+                print(f"📍 {p['name'][:15]} | "
+                      f"Dist.Reale: {dist_r:7.1f}m | Dist.IA: {dist_w:7.1f}m | "
+                      f"T.Std: {exec_time_1:.5f}s | T.Bidir: {exec_time_2:.5f}s | {status_icon}")
+
+                # Determine text status
+                status_text = "⚠️ PERICOLO" if is_dangerous else "✅ SICURO"
+
+                print(f"\n📊 RISULTATO ANALISI:")
+                print(f"   - Reale (senza ostacoli): {dist_r:.0f} m")
+                print(f"   - IA (con ostacoli):      {dist_w:.0f} m")
+                print(f"   - Differenza:             {dist_w - dist_r:.0f} m")
+                print(f"   - Tempo Standard:         {exec_time_1:.5f} s")
+                print(f"   - Tempo Bidirezionale:    {exec_time_2:.5f} s")
+                print(f"   - Status:                 {status_text}")
+                if is_blocked:
+                    print(f"   - Note:                   🚫 BLOCCATO (> 50km)")
+                elif is_dangerous:
+                    print(f"   - Note:                   ⚠️ DEVIAZIONE RILEVATA")
+
+                results.append({
+                    "title": str(p.get('name', 'N/A')),
+                    "type": str(p.get('type', 'generic')),
+                    "lat": float(p['lat']),
+                    "lng": float(p['lng']),
+                    "distance": float(dist_w) if is_dangerous else float(dist_r),
+                    "dist_real": float(dist_r),
+                    "isDangerous": bool(is_dangerous),
+                    "isBlocked": bool(is_blocked),
+                    "exec_time_baseline": exec_time_1,
+                    "exec_time_research": exec_time_2
+                })
+
             except Exception as e:
                 print(f"❗ Errore su {p['name']}: {e}")
-                dist_r = 999999
-                is_dangerous = True
+                continue
 
-            results.append({
-                "title": str(p.get('name', 'N/A')),
-                "type": str(p.get('type', 'generic')),
-                "lat": float(p['lat']),
-                "lng": float(p['lng']),
-                # Se is_dangerous è True, inviamo la distanza con la deviazione (dist_w)
-                "distance": float(dist_w) if is_dangerous else float(dist_r),
-                # Inviato per calcolare il "+ ritardo" in Flutter
-                "dist_real": float(dist_r),
-                "isDangerous": bool(is_dangerous),
-                "isBlocked": bool(is_blocked)
-            })
+        # ... (restante codice invariato) ...
 
         print("--- 🏁 FINE DEBUG ---\n")
-
-        # Ordina: prima i sicuri, poi i pericolosi
         results.sort(key=lambda x: x['distance'])
-
         return results
 
     except Exception as e:
@@ -119,5 +123,4 @@ async def get_sorted_points(req: UserLocation):
         return []
 
 if __name__ == "__main__":
-    # Avvio del server
     uvicorn.run(app, host="0.0.0.0", port=8000)
