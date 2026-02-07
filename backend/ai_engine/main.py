@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from algorithms import bidirectional_dijkstra
 from enviroment import SafeGuardEnv
 
+
 # Inizializzazione dell'ambiente SafeGuard
 env = SafeGuardEnv()
 
@@ -20,6 +21,7 @@ async def lifespan(_: FastAPI):
     yield
 
 app = FastAPI(lifespan=lifespan)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -98,8 +100,48 @@ async def get_sorted_points(req: UserLocation):
                 print(f"❗ Errore su {p['name']}: {e}")
                 continue
 
-        print("--- 🏁 FINE DEBUG ---\n")
         results.sort(key=lambda x: x['distance'])
+
+        # --- FORMATTAZIONE OUTPUT RICHIESTA UTENTE ---
+        print(f"\n{'='*60}")
+        print(f"📍  RAPPORTO ANALISI SICUREZZA - SAFEGUARD")
+        print(f"{'='*60}\n")
+
+        # RECAP GENERALE
+        print(f"📊  RECAP GENERALE")
+        print(f"   • Punti Totali Rilevati:    {len(punti)}")
+        top_area = results[0]['title'] if results else 'N/A'
+        print(f"   • Zona Densità Maggiore:    {top_area}") 
+        
+        status_val = "OTTIMALE 🟢"
+        if any(r['isDangerous'] for r in results): status_val = "ATTENZIONE 🟡"
+        if any(r['isBlocked'] for r in results): status_val = "CRITICO 🔴"
+        
+        print(f"   • Valutazione Area:         {status_val}\n")
+
+        print(f"{'-'*60}\n")
+
+        # DETTAGLIO PUNTI SICURI
+        print(f"📋  DETTAGLIO PUNTI SICURI\n")
+        for i, res in enumerate(results, 1):
+            icon = "✅"
+            state_text = "SICURO"
+            if res['isDangerous']: 
+                icon = "⚠️"
+                state_text = "PERICOLOSO"
+            if res['isBlocked']: 
+                icon = "⛔"
+                state_text = "NON RAGGIUNGIBILE"
+
+            print(f"   {i}. {res['title'].upper()} ({res['type']})")
+            print(f"      📍 {res['lat']:.5f}, {res['lng']:.5f}")
+            print(f"      📏 {res['distance']:.0f}m (Reale: {res['dist_real']:.0f}m)")
+            print(f"      🛡️  {state_text} {icon}")
+            print(f"      ⏱️  IA: {res['exec_time_research']:.4f}s | Base: {res['exec_time_baseline']:.4f}s")
+            print("")
+
+        print(f"{'='*60}\n")
+
         return results
 
     except Exception as e:

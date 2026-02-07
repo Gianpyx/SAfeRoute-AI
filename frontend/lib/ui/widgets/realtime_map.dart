@@ -442,7 +442,7 @@ class _RealtimeMapState extends State<RealtimeMap> {
         // Pulsanti
         Positioned(
           top: 20,
-          right: 20,
+          left: 20,
           child: Column(
             children: [
               FloatingActionButton(
